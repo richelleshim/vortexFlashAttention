@@ -171,8 +171,8 @@ int main(int argc, char *argv[]) {
   // calculate block sizes
   // uint32_t block_size_c = std::min(static_cast<uint32_t>(std::ceil(M / (4 * d))), N);
   // uint32_t block_size_r = std::min(block_size_c, d);
-  uint32_t block_size_c = 4;
-  uint32_t block_size_r = 4;
+  uint32_t block_size_c = (0 == strcmp(kernel_kind, "tcu")) ? 8u : 4u;
+  uint32_t block_size_r = block_size_c;
 
   uint32_t size = N * d;
   uint32_t buf_size = size * sizeof(TYPE);

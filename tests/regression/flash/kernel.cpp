@@ -1,4 +1,5 @@
 #include <vx_spawn.h>
+#include <vx_tensor.h>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -6,9 +7,11 @@
 #include <cstdio>
 #include "common.h"
 
+namespace vt = vortex::tensor;
+
 // Need to be known at compile-time
 static constexpr uint32_t HEAD_DIM = 8;
-static constexpr uint32_t BLOCK_SIZE_C = 4;
+static constexpr uint32_t BLOCK_SIZE_C_MAX = 8;
 
 void flashattention_simt(kernel_arg_t *arg) {
     // Setup buffer arguments
@@ -19,13 +22,14 @@ void flashattention_simt(kernel_arg_t *arg) {
 
     auto seq_len = arg->seq_len;
     auto block_size_r = arg->block_size_r;
+    auto block_size_c = arg->block_size_c;
 
     // Allocate local memory
     // Must store tile of Q (b_r x d) +  K, V (b_c x d)
-    auto local_ptr = __local_mem((block_size_r + 2 * BLOCK_SIZE_C) * HEAD_DIM * sizeof(float));
+    auto local_ptr = __local_mem((block_size_r + 2 * block_size_c) * HEAD_DIM * sizeof(float));
     auto local_Q = (float*)local_ptr;
     auto local_K = (float*)local_Q + block_size_r * HEAD_DIM;
-    auto local_V = (float*)local_K + BLOCK_SIZE_C * HEAD_DIM;
+    auto local_V = (float*)local_K + block_size_c * HEAD_DIM;
 
     // Determine global/local row index
     auto g_row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -46,7 +50,7 @@ void flashattention_simt(kernel_arg_t *arg) {
       O_buf[col] = 0.0f;
 
     // Create buffer to store row of S and P
-    float sp_buf[BLOCK_SIZE_C];
+    float sp_buf[BLOCK_SIZE_C_MAX];
 
     // Initialize m_i, l_i
     float m = -INFINITY;
@@ -56,19 +60,19 @@ void flashattention_simt(kernel_arg_t *arg) {
     float* Q_row = local_Q + l_row * HEAD_DIM;
 
     // Loop over blocks of K and V
-    for (uint32_t j = 0; j < seq_len; j += BLOCK_SIZE_C) {
+    for (uint32_t j = 0; j < seq_len; j += block_size_c) {
         uint32_t block_offset = j * HEAD_DIM;
 
         // Load K_j and V_j^T
-        // BLOCK_SIZE_C % block_size_r = 0
-        for (uint32_t k = 0; k < BLOCK_SIZE_C / block_size_r; ++k) {
+        // block_size_c % block_size_r = 0
+        for (uint32_t k = 0; k < block_size_c / block_size_r; ++k) {
           auto row = k * block_size_r + l_row;
           auto row_offset = row * HEAD_DIM;
           for (uint32_t col = 0; col < HEAD_DIM; ++col) {
             auto offset = row_offset + col;
             local_K[offset] = K_ptr[block_offset + offset];
             // Store transpose of V_j
-            local_V[col * BLOCK_SIZE_C + row] = V_ptr[block_offset + offset];
+            local_V[col * block_size_c + row] = V_ptr[block_offset + offset];
           }
         }
 
@@ -90,18 +94,18 @@ void flashattention_simt(kernel_arg_t *arg) {
         // Row max
         float rowmax = sp_buf[0];
         #pragma clang loop unroll(full)
-        for (uint32_t k = 1; k < BLOCK_SIZE_C; ++k)
+        for (uint32_t k = 1; k < block_size_c; ++k)
           if (sp_buf[k] > rowmax) rowmax = sp_buf[k];
 
         // Threads row of P_ij
         #pragma clang loop unroll(full)
-        for (uint32_t k = 0; k < BLOCK_SIZE_C; ++k)
+        for (uint32_t k = 0; k < block_size_c; ++k)
           sp_buf[k] = expf(sp_buf[k] - rowmax);
 
         // Row sum
         float rowsum = 0;
         #pragma clang loop unroll(full)
-        for (uint32_t k = 0; k < BLOCK_SIZE_C; ++k)
+        for (uint32_t k = 0; k < block_size_c; ++k)
           rowsum += sp_buf[k];
 
         float inv_rowsum = 1.0f / rowsum;
