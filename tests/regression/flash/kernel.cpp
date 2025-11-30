@@ -10,7 +10,7 @@
 static constexpr uint32_t HEAD_DIM = 8;
 static constexpr uint32_t BLOCK_SIZE_C = 4;
 
-void kernel_body(kernel_arg_t *arg) {
+void flashattention_simt(kernel_arg_t *arg) {
     // Setup buffer arguments
     float* Q_ptr = reinterpret_cast<float*>(arg->Q_addr);
     float* K_ptr = reinterpret_cast<float*>(arg->K_addr);
@@ -39,7 +39,7 @@ void kernel_body(kernel_arg_t *arg) {
     for (uint32_t col = 0; col < HEAD_DIM; ++col)
         local_Q[l_row_offset + col] = Q_ptr[g_row_offset + col];
 
-    // Initialize O_i in registers
+    // Initialize O_i in registers (accumulates l_i * O_i)
     float O_buf[HEAD_DIM];
     #pragma clang loop unroll(full)
     for (uint32_t col = 0; col < HEAD_DIM; ++col)
@@ -77,6 +77,9 @@ void kernel_body(kernel_arg_t *arg) {
         // Thread's row of S_ij = Q_i · K_j^T
         // Compute dot product of thread's Q row and each row of K_j
         #pragma clang loop unroll(full)
+        for (uint32_t k = 0; k < BLOCK_SIZE_C; ++k)
+          sp_buf[k] = 0.0f;
+        #pragma clang loop unroll(full)
         for (uint32_t k = 0; k < BLOCK_SIZE_C; ++k) {
           // sp_buf[k] = 0;
           #pragma clang loop unroll(full)
@@ -101,41 +104,50 @@ void kernel_body(kernel_arg_t *arg) {
         for (uint32_t k = 0; k < BLOCK_SIZE_C; ++k)
           rowsum += sp_buf[k];
 
-        // Compute new m and l
-        float new_m = (m > rowmax ? m : rowmax);
-        float new_l = expf(m - new_m) * l + expf(rowmax - new_m) * rowsum;
+        float inv_rowsum = 1.0f / rowsum;
 
-        // Weights of old and new O
+        // Compute new m and l using streaming softmax update
+        float new_m = (m > rowmax ? m : rowmax);
         float old_weight = expf(m - new_m);
         float new_weight = expf(rowmax - new_m);
+        float new_l = old_weight * l + new_weight;
 
-        // Update O
+        // Update O with normalized probabilities
         #pragma clang loop unroll(full)
         for (uint32_t k = 0; k < HEAD_DIM; ++k) {
-          // Compute dot product of thread's P_ij row and each col of V_j
           float dot = 0;
           #pragma clang loop unroll(full)
           for (uint32_t elem = 0; elem < BLOCK_SIZE_C; ++elem)
-            dot += sp_buf[elem] * local_V[k * BLOCK_SIZE_C + elem];
-          O_buf[k] = old_weight * O_buf[k] + new_weight * dot;
+            dot += (sp_buf[elem] * inv_rowsum) * local_V[k * BLOCK_SIZE_C + elem];
+          float old_contrib = (l > 0) ? (old_weight * l * O_buf[k]) : 0.0f;
+          float new_contrib = new_weight * dot;
+          O_buf[k] = (old_contrib + new_contrib) / new_l;
         }
 
         // Update m and l for next block
         m = new_m;
         l = new_l;
 
-        // #pragma clang loop unroll(full)
-        // for (uint32_t k = 0; k < BLOCK_SIZE_C; ++k)
-        //     sp_buf[k] = 0;
-
-        // __syncthreads();
+        __syncthreads();
     }
 
     // Normalize O and write back to HBM
-    float inv_l = 1.0f / l;
+    float inv_l = (l > 0) ? (1.0f / l) : 0.0f;
     #pragma clang loop unroll(full)
     for (uint32_t k = 0; k < HEAD_DIM; ++k)
       O_ptr[g_row_offset + k] = O_buf[k] * inv_l;
+}
+
+void flashattention_tcu(kernel_arg_t *arg) {
+    // Placeholder dispatch to SIMT path until TCU path is implemented.
+    flashattention_simt(arg);
+}
+
+void kernel_body(kernel_arg_t *arg) {
+    if (arg->kernel_type == 1)
+        flashattention_tcu(arg);
+    else
+        flashattention_simt(arg);
 }
 
 int main() {

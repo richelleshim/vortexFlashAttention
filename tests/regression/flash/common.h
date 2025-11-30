@@ -12,6 +12,7 @@ typedef struct {
   uint32_t head_dim;
   uint32_t block_size_r;
   uint32_t block_size_c;
+  uint32_t kernel_type; // 0: simt, 1: tcu
   uint64_t Q_addr;
   uint64_t K_addr;
   uint64_t V_addr;
