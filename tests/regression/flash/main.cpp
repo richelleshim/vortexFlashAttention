@@ -86,6 +86,7 @@ static void attention_cpu(float* out, const float* Q, const float* K, const floa
 }
 
 const char* kernel_file = "kernel.vxbin";
+const char* kernel_kind = "simt";
 uint32_t N = 64;
 uint32_t d = 8;
 
@@ -100,11 +101,18 @@ kernel_arg_t kernel_arg = {};
 
 static void show_usage() {
    std::cout << "Vortex Test." << std::endl;
-   std::cout << "Usage: [-k: kernel] [-n:sequence_len] [-d:head_dim] [-h: help]" << std::endl;
+   std::cout << "Usage: [-k: kernel] [--kernel simt|tcu] [-n:sequence_len] [-d:head_dim] [-h: help]" << std::endl;
 }
 
 static void parse_args(int argc, char **argv) {
   int c;
+  // parse long options manually
+  for (int idx = 1; idx < argc; ++idx) {
+    if (0 == strncmp(argv[idx], "--kernel=", 9)) {
+      kernel_kind = argv[idx] + 9;
+    }
+  }
+
   while ((c = getopt(argc, argv, "n:d:k:h")) != -1) {
     switch (c) {
     case 'n':
@@ -163,8 +171,8 @@ int main(int argc, char *argv[]) {
   // calculate block sizes
   // uint32_t block_size_c = std::min(static_cast<uint32_t>(std::ceil(M / (4 * d))), N);
   // uint32_t block_size_r = std::min(block_size_c, d);
-  uint32_t block_size_c = 4;
-  uint32_t block_size_r = 4;
+  uint32_t block_size_c = (0 == strcmp(kernel_kind, "tcu")) ? 8u : 4u;
+  uint32_t block_size_r = block_size_c;
 
   uint32_t size = N * d;
   uint32_t buf_size = size * sizeof(TYPE);
@@ -182,6 +190,7 @@ int main(int argc, char *argv[]) {
   std::cout << "sequence length: " << N << std::endl;
   std::cout << "head dimension: " << d << std::endl;
   std::cout << "local memory: " << local_mem << " bytes" << std::endl;
+  std::cout << "kernel kind: " << kernel_kind << std::endl;
 
   // Set kernel args
   kernel_arg.grid_dim[0] = N / block_size_r;
@@ -190,6 +199,7 @@ int main(int argc, char *argv[]) {
   kernel_arg.head_dim = d;
   kernel_arg.block_size_r = block_size_r;
   kernel_arg.block_size_c = block_size_c;
+  kernel_arg.kernel_type = (0 == strcmp(kernel_kind, "tcu")) ? 1u : 0u;
 
   // allocate device memory
   std::cout << "allocate device memory" << std::endl;
